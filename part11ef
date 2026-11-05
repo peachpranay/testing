@@ -1,142 +1,50 @@
 
-# ============================================================
-# STEP 11.7: CORRECTED WARNING QUALITY AUDIT
-# ============================================================
+# STEP 11.8: DETECTION RECONCILIATION
 
 import pandas as pd
-import numpy as np
-
-df = evaluated.copy()
-
-# Only episodes with an actual warning
-warnings = df[df["WARNING"] == 1].copy()
-
-# Separate replacement and censored warnings
-replacement_warnings = warnings[warnings["EVENT"] == 1].copy()
-censored_warnings = warnings[warnings["EVENT"] == 0].copy()
-
-# ------------------------------------------------------------
-# 1. WARNING RECORD COUNTS
-# ------------------------------------------------------------
 
 print("=" * 65)
-print("STEP 11.7: CORRECTED WARNING AUDIT")
+print("STEP 11.8: DETECTION RECONCILIATION")
 print("=" * 65)
 
-print("Total episodes:", len(df))
-print("Actual warning episodes:", len(warnings))
-print("Replacement warnings:", len(replacement_warnings))
-print("Censored warnings:", len(censored_warnings))
+print("\nEVALUATED DATAFRAME")
+print("Rows:", len(evaluated))
+print("Columns:", evaluated.columns.tolist())
 
-# ------------------------------------------------------------
-# 2. CHECK WARNING TIMING
-# ------------------------------------------------------------
-
-replacement_warnings["CALCULATED_LEAD"] = (
-    replacement_warnings["EVENT_TIME"]
-    - replacement_warnings["WARNING_START"]
+# Detected replacement episodes
+detected_35 = set(
+    evaluated.loc[
+        (evaluated["EVENT"] == 1) &
+        (evaluated["WARNING"] == 1),
+        "EPISODE_ID"
+    ].astype(str)
 )
 
-replacement_warnings["VALID_TIMING"] = (
-    replacement_warnings["WARNING_START"].notna()
-    & replacement_warnings["EVENT_TIME"].notna()
-    & (replacement_warnings["WARNING_START"]
-       < replacement_warnings["EVENT_TIME"])
+print("\nDetected replacement episodes:", len(detected_35))
+
+# Missed replacement episodes
+missed_15 = set(
+    evaluated.loc[
+        (evaluated["EVENT"] == 1) &
+        (evaluated["WARNING"] == 0),
+        "EPISODE_ID"
+    ].astype(str)
 )
 
-print("\nREPLACEMENT WARNING TIMING")
-print("-" * 50)
+print("Missed replacement episodes:", len(missed_15))
 
-print("Replacement warnings:",
-      len(replacement_warnings))
+# Show all other relevant DataFrames
+print("\nPOTENTIAL SOURCE DATAFRAMES")
+print("-" * 65)
 
-print("Valid warning timestamps:",
-      replacement_warnings["WARNING_START"].notna().sum())
+for name, obj in list(globals().items()):
+    if isinstance(obj, pd.DataFrame):
+        cols = obj.columns.tolist()
 
-print("Valid event timestamps:",
-      replacement_warnings["EVENT_TIME"].notna().sum())
+        if "EPISODE_ID" in cols:
+            print(
+                f"{name}: rows={len(obj)}, "
+                f"columns={cols}"
+            )
 
-print("Warnings before replacement:",
-      replacement_warnings["VALID_TIMING"].sum())
-
-print("Invalid timing:",
-      (~replacement_warnings["VALID_TIMING"]).sum())
-
-# ------------------------------------------------------------
-# 3. LEAD TIME VALIDATION
-# ------------------------------------------------------------
-
-valid = replacement_warnings[
-    replacement_warnings["VALID_TIMING"]
-].copy()
-
-valid["LEAD_MATCH"] = np.isclose(
-    valid["LEAD_TIME"],
-    valid["CALCULATED_LEAD"],
-    rtol=1e-5,
-    atol=1e-5
-)
-
-print("\nLEAD TIME VALIDATION")
-print("-" * 50)
-
-print("Valid lead records:", len(valid))
-print("Matching lead calculations:", valid["LEAD_MATCH"].sum())
-print("Mismatches:", (~valid["LEAD_MATCH"]).sum())
-
-print("\nLead-time distribution:")
-
-display(
-    valid["CALCULATED_LEAD"].describe(
-        percentiles=[.10, .25, .50, .75, .90, .95]
-    ).to_frame()
-)
-
-# ------------------------------------------------------------
-# 4. CENSORED WARNINGS
-# ------------------------------------------------------------
-
-print("\nCENSORED WARNINGS")
-print("-" * 50)
-
-print("Censored warnings:", len(censored_warnings))
-
-print("Censored warnings with warning timestamp:",
-      censored_warnings["WARNING_START"].notna().sum())
-
-print("\nThese are unresolved alerts, not confirmed false alarms.")
-
-# ------------------------------------------------------------
-# 5. WARNINGS WITHOUT A REPLACEMENT
-# ------------------------------------------------------------
-
-no_warning = df[df["WARNING"] == 0]
-
-print("\nNO-WARNING EPISODES")
-print("-" * 50)
-
-print("No-warning episodes:", len(no_warning))
-print("No-warning replacement episodes:",
-      ((no_warning["EVENT"] == 1)).sum())
-
-print("No-warning censored episodes:",
-      ((no_warning["EVENT"] == 0)).sum())
-
-print("\nMissing timestamps in no-warning episodes are EXPECTED.")
-
-# ------------------------------------------------------------
-# 6. FINAL SUMMARY
-# ------------------------------------------------------------
-
-print("\n" + "=" * 65)
-print("CORRECTED AUDIT SUMMARY")
-print("=" * 65)
-
-print("Total episodes:", len(df))
-print("Actual warnings:", len(warnings))
-print("Replacement warnings:", len(replacement_warnings))
-print("Censored warnings:", len(censored_warnings))
-print("Valid replacement warning timings:", len(valid))
-print("Valid lead-time matches:", valid["LEAD_MATCH"].sum())
-
-print("\nSTEP 11.7 COMPLETE")
+print("\nSTEP 11.8 DIAGNOSTIC COMPLETE")
