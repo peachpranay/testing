@@ -1,165 +1,142 @@
 
 # ============================================================
-# STEP 11.6: DETECTION RECONCILIATION AND WARNING AUDIT
+# STEP 11.7: CORRECTED WARNING QUALITY AUDIT
 # ============================================================
 
 import pandas as pd
 import numpy as np
 
-audit = evaluated.copy()
+df = evaluated.copy()
 
-for col in ["EVENT", "WARNING", "WARNING_START",
-            "EVENT_TIME", "LEAD_TIME"]:
-    audit[col] = pd.to_numeric(audit[col], errors="coerce")
+# Only episodes with an actual warning
+warnings = df[df["WARNING"] == 1].copy()
+
+# Separate replacement and censored warnings
+replacement_warnings = warnings[warnings["EVENT"] == 1].copy()
+censored_warnings = warnings[warnings["EVENT"] == 0].copy()
 
 # ------------------------------------------------------------
-# 1. CLASSIFY ALL EPISODES
+# 1. WARNING RECORD COUNTS
 # ------------------------------------------------------------
 
-conditions = [
-    (audit.EVENT == 1) & (audit.WARNING == 1),
-    (audit.EVENT == 1) & (audit.WARNING == 0),
-    (audit.EVENT == 0) & (audit.WARNING == 1),
-    (audit.EVENT == 0) & (audit.WARNING == 0)
-]
+print("=" * 65)
+print("STEP 11.7: CORRECTED WARNING AUDIT")
+print("=" * 65)
 
-labels = [
-    "DETECTED_REPLACEMENT",
-    "MISSED_REPLACEMENT",
-    "CENSORED_WITH_WARNING",
-    "CENSORED_WITHOUT_WARNING"
-]
+print("Total episodes:", len(df))
+print("Actual warning episodes:", len(warnings))
+print("Replacement warnings:", len(replacement_warnings))
+print("Censored warnings:", len(censored_warnings))
 
-audit["OUTCOME"] = np.select(
-    conditions, labels, default="UNKNOWN"
+# ------------------------------------------------------------
+# 2. CHECK WARNING TIMING
+# ------------------------------------------------------------
+
+replacement_warnings["CALCULATED_LEAD"] = (
+    replacement_warnings["EVENT_TIME"]
+    - replacement_warnings["WARNING_START"]
 )
 
-print("=" * 70)
-print("STEP 11.6: EPISODE OUTCOME SUMMARY")
-print("=" * 70)
-
-display(
-    audit["OUTCOME"].value_counts()
-    .rename_axis("OUTCOME")
-    .to_frame("EPISODES")
+replacement_warnings["VALID_TIMING"] = (
+    replacement_warnings["WARNING_START"].notna()
+    & replacement_warnings["EVENT_TIME"].notna()
+    & (replacement_warnings["WARNING_START"]
+       < replacement_warnings["EVENT_TIME"])
 )
 
-# ------------------------------------------------------------
-# 2. CALCULATE TRUE REPLACEMENT DETECTION RATE
-# ------------------------------------------------------------
-
-replacement = audit[audit.EVENT == 1].copy()
-
-detected = replacement[replacement.WARNING == 1]
-missed = replacement[replacement.WARNING == 0]
-
-detection_rate = len(detected) / len(replacement)
-
-print("\nREPLACEMENT PERFORMANCE")
+print("\nREPLACEMENT WARNING TIMING")
 print("-" * 50)
 
-print("Replacement episodes:", len(replacement))
-print("Detected:", len(detected))
-print("Missed:", len(missed))
-print("Detection rate:", round(detection_rate * 100, 2), "%")
+print("Replacement warnings:",
+      len(replacement_warnings))
+
+print("Valid warning timestamps:",
+      replacement_warnings["WARNING_START"].notna().sum())
+
+print("Valid event timestamps:",
+      replacement_warnings["EVENT_TIME"].notna().sum())
+
+print("Warnings before replacement:",
+      replacement_warnings["VALID_TIMING"].sum())
+
+print("Invalid timing:",
+      (~replacement_warnings["VALID_TIMING"]).sum())
 
 # ------------------------------------------------------------
-# 3. DISPLAY MISSED REPLACEMENTS
+# 3. LEAD TIME VALIDATION
 # ------------------------------------------------------------
 
-print("\nMISSED REPLACEMENT EPISODES")
-
-display(
-    missed[
-        ["EPISODE_ID", "EVENT", "WARNING",
-         "WARNING_START", "EVENT_TIME"]
-    ].sort_values("EPISODE_ID")
-)
-
-# ------------------------------------------------------------
-# 4. CENSORED EPISODES WITH WARNINGS
-# ------------------------------------------------------------
-
-censored_alerts = audit[
-    (audit.EVENT == 0) & (audit.WARNING == 1)
+valid = replacement_warnings[
+    replacement_warnings["VALID_TIMING"]
 ].copy()
 
-print("\nCENSORED EPISODES RECEIVING WARNINGS")
-
-display(
-    censored_alerts[
-        ["EPISODE_ID", "WARNING_START",
-         "EVENT_TIME", "LEAD_TIME"]
-    ]
+valid["LEAD_MATCH"] = np.isclose(
+    valid["LEAD_TIME"],
+    valid["CALCULATED_LEAD"],
+    rtol=1e-5,
+    atol=1e-5
 )
 
-# These are unresolved alerts, NOT confirmed false positives.
+print("\nLEAD TIME VALIDATION")
+print("-" * 50)
 
-# ------------------------------------------------------------
-# 5. INVESTIGATE EXTREMELY LONG LEAD TIMES
-# ------------------------------------------------------------
+print("Valid lead records:", len(valid))
+print("Matching lead calculations:", valid["LEAD_MATCH"].sum())
+print("Mismatches:", (~valid["LEAD_MATCH"]).sum())
 
-valid_leads = detected[
-    detected.LEAD_TIME.notna() & (detected.LEAD_TIME > 0)
-].copy()
-
-print("\nLEAD TIME DISTRIBUTION")
+print("\nLead-time distribution:")
 
 display(
-    valid_leads["LEAD_TIME"].describe(
+    valid["CALCULATED_LEAD"].describe(
         percentiles=[.10, .25, .50, .75, .90, .95]
     ).to_frame()
 )
 
-print("\nTOP 10 EARLIEST WARNINGS")
-
-display(
-    valid_leads[
-        ["EPISODE_ID", "WARNING_START",
-         "EVENT_TIME", "LEAD_TIME"]
-    ].sort_values("LEAD_TIME", ascending=False).head(10)
-)
-
 # ------------------------------------------------------------
-# 6. ESN / MULTIPLE EPISODE REVIEW
+# 4. CENSORED WARNINGS
 # ------------------------------------------------------------
 
-audit["ESN"] = audit["EPISODE_ID"].astype(str).str.replace(
-    r"_\d+$", "", regex=True
-)
+print("\nCENSORED WARNINGS")
+print("-" * 50)
 
-multiple = audit.groupby("ESN").agg(
-    EPISODES=("EPISODE_ID", "nunique"),
-    REPLACEMENTS=("EVENT", "sum"),
-    WARNINGS=("WARNING", "sum")
-).reset_index()
+print("Censored warnings:", len(censored_warnings))
 
-print("\nMULTIPLE EPISODE SUMMARY")
+print("Censored warnings with warning timestamp:",
+      censored_warnings["WARNING_START"].notna().sum())
 
-print("Unique ESNs:", audit.ESN.nunique())
-print("ESNs with multiple episodes:",
-      (multiple.EPISODES > 1).sum())
-
-print("\nESNs with multiple replacement events")
-
-display(
-    multiple[multiple.REPLACEMENTS > 1]
-    .sort_values("REPLACEMENTS", ascending=False)
-)
+print("\nThese are unresolved alerts, not confirmed false alarms.")
 
 # ------------------------------------------------------------
-# 7. FINAL RECONCILIATION
+# 5. WARNINGS WITHOUT A REPLACEMENT
 # ------------------------------------------------------------
 
-print("\n" + "=" * 70)
-print("FINAL RECONCILIATION")
-print("=" * 70)
+no_warning = df[df["WARNING"] == 0]
 
-print("Total episodes:", len(audit))
-print("Actual replacements:", len(replacement))
-print("Detected replacements:", len(detected))
-print("Missed replacements:", len(missed))
-print("Censored alerts:", len(censored_alerts))
-print("Detection rate:", round(detection_rate * 100, 2), "%")
+print("\nNO-WARNING EPISODES")
+print("-" * 50)
 
-print("\nSTEP 11.6 COMPLETE")
+print("No-warning episodes:", len(no_warning))
+print("No-warning replacement episodes:",
+      ((no_warning["EVENT"] == 1)).sum())
+
+print("No-warning censored episodes:",
+      ((no_warning["EVENT"] == 0)).sum())
+
+print("\nMissing timestamps in no-warning episodes are EXPECTED.")
+
+# ------------------------------------------------------------
+# 6. FINAL SUMMARY
+# ------------------------------------------------------------
+
+print("\n" + "=" * 65)
+print("CORRECTED AUDIT SUMMARY")
+print("=" * 65)
+
+print("Total episodes:", len(df))
+print("Actual warnings:", len(warnings))
+print("Replacement warnings:", len(replacement_warnings))
+print("Censored warnings:", len(censored_warnings))
+print("Valid replacement warning timings:", len(valid))
+print("Valid lead-time matches:", valid["LEAD_MATCH"].sum())
+
+print("\nSTEP 11.7 COMPLETE")
