@@ -1,0 +1,167 @@
+
+# ============================================================
+# STEP 11.5B: CORRECTED WARNING AUDIT
+# Uses the actual evaluated DataFrame
+# Time unit: CYCLES
+# ============================================================
+
+import pandas as pd
+import numpy as np
+
+df = evaluated.copy()
+
+# Standardise column names
+df.columns = [str(c).upper().strip() for c in df.columns]
+
+required_cols = [
+    "EPISODE_ID", "EVENT", "WARNING",
+    "WARNING_START", "EVENT_TIME", "LEAD_TIME"
+]
+
+missing = [c for c in required_cols if c not in df.columns]
+
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
+
+print("=" * 70)
+print("1. EPISODE COUNTS")
+print("=" * 70)
+
+print("Total episodes:", len(df))
+print("\nEVENT values:")
+print(df["EVENT"].value_counts(dropna=False))
+
+print("\nWARNING values:")
+print(df["WARNING"].value_counts(dropna=False))
+
+print("\nEVENT vs WARNING:")
+display(pd.crosstab(
+    df["EVENT"], df["WARNING"], dropna=False
+))
+
+# ------------------------------------------------------------
+# 2. MISSING DATA BY EVENT AND WARNING GROUP
+# ------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("2. MISSING TIMING INFORMATION")
+print("=" * 70)
+
+missing_summary = df.groupby(
+    ["EVENT", "WARNING"], dropna=False
+).agg(
+    EPISODES=("EPISODE_ID", "size"),
+    MISSING_WARNING_START=("WARNING_START",
+                           lambda x: x.isna().sum()),
+    MISSING_EVENT_TIME=("EVENT_TIME",
+                        lambda x: x.isna().sum()),
+    MISSING_LEAD_TIME=("LEAD_TIME",
+                       lambda x: x.isna().sum())
+).reset_index()
+
+display(missing_summary)
+
+# ------------------------------------------------------------
+# 3. CHECK ONLY RECORDS WITH BOTH TIMES AVAILABLE
+# ------------------------------------------------------------
+
+for col in ["WARNING_START", "EVENT_TIME", "LEAD_TIME"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+timed = df[
+    df["WARNING_START"].notna()
+    & df["EVENT_TIME"].notna()
+].copy()
+
+timed["CALCULATED_LEAD_CYCLES"] = (
+    timed["EVENT_TIME"] - timed["WARNING_START"]
+)
+
+timed["POSITIVE_LEAD"] = (
+    timed["CALCULATED_LEAD_CYCLES"] > 0
+)
+
+timed["LEAD_MATCH"] = np.isclose(
+    timed["LEAD_TIME"],
+    timed["CALCULATED_LEAD_CYCLES"],
+    rtol=1e-5,
+    atol=1e-5,
+    equal_nan=False
+)
+
+print("\n" + "=" * 70)
+print("3. TIMED RECORDS ONLY")
+print("=" * 70)
+
+print("Records with both timestamps:", len(timed))
+print("Positive lead times:",
+      int(timed["POSITIVE_LEAD"].sum()))
+print("Non-positive lead times:",
+      int((~timed["POSITIVE_LEAD"]).sum()))
+print("Reported/calculated lead matches:",
+      int(timed["LEAD_MATCH"].sum()))
+
+print("\nLead-time distribution (cycles):")
+
+display(
+    timed.loc[timed["POSITIVE_LEAD"],
+              "CALCULATED_LEAD_CYCLES"]
+    .describe(percentiles=[.10, .25, .50, .75, .90])
+    .to_frame()
+)
+
+# ------------------------------------------------------------
+# 4. SHOW ACTUAL WARNING/REPLACEMENT RECORDS
+# ------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("4. RECORD-LEVEL REVIEW")
+print("=" * 70)
+
+display(
+    df[
+        [
+            "EPISODE_ID", "EVENT", "WARNING",
+            "WARNING_START", "EVENT_TIME",
+            "LEAD_TIME"
+        ]
+    ].head(40)
+)
+
+# ------------------------------------------------------------
+# 5. MULTIPLE REPLACEMENT EPISODE CHECK
+# ------------------------------------------------------------
+
+df["ESN"] = df["EPISODE_ID"].astype(str).str.replace(
+    r"_\d+$", "", regex=True
+)
+
+esn_summary = df.groupby("ESN").agg(
+    EPISODES=("EPISODE_ID", "nunique"),
+    TOTAL_RECORDS=("EPISODE_ID", "size")
+).reset_index()
+
+print("\n" + "=" * 70)
+print("5. MULTIPLE EPISODES PER ESN")
+print("=" * 70)
+
+print("Unique ESNs:", df["ESN"].nunique())
+print("ESNs with multiple episodes:",
+      int((esn_summary["EPISODES"] > 1).sum()))
+
+display(
+    esn_summary[esn_summary["EPISODES"] > 1]
+    .sort_values("EPISODES", ascending=False)
+)
+
+# ------------------------------------------------------------
+# 6. DUPLICATE EPISODE CHECK
+# ------------------------------------------------------------
+
+print("\nDuplicate episode records:",
+      int(df["EPISODE_ID"].duplicated().sum()))
+
+print("\n" + "=" * 70)
+print("STEP 11.5B COMPLETE")
+print("No model or threshold has been changed.")
+print("=" * 70)
