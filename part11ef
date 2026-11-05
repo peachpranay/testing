@@ -1,167 +1,165 @@
 
 # ============================================================
-# STEP 11.5B: CORRECTED WARNING AUDIT
-# Uses the actual evaluated DataFrame
-# Time unit: CYCLES
+# STEP 11.6: DETECTION RECONCILIATION AND WARNING AUDIT
 # ============================================================
 
 import pandas as pd
 import numpy as np
 
-df = evaluated.copy()
+audit = evaluated.copy()
 
-# Standardise column names
-df.columns = [str(c).upper().strip() for c in df.columns]
+for col in ["EVENT", "WARNING", "WARNING_START",
+            "EVENT_TIME", "LEAD_TIME"]:
+    audit[col] = pd.to_numeric(audit[col], errors="coerce")
 
-required_cols = [
-    "EPISODE_ID", "EVENT", "WARNING",
-    "WARNING_START", "EVENT_TIME", "LEAD_TIME"
+# ------------------------------------------------------------
+# 1. CLASSIFY ALL EPISODES
+# ------------------------------------------------------------
+
+conditions = [
+    (audit.EVENT == 1) & (audit.WARNING == 1),
+    (audit.EVENT == 1) & (audit.WARNING == 0),
+    (audit.EVENT == 0) & (audit.WARNING == 1),
+    (audit.EVENT == 0) & (audit.WARNING == 0)
 ]
 
-missing = [c for c in required_cols if c not in df.columns]
+labels = [
+    "DETECTED_REPLACEMENT",
+    "MISSED_REPLACEMENT",
+    "CENSORED_WITH_WARNING",
+    "CENSORED_WITHOUT_WARNING"
+]
 
-if missing:
-    raise ValueError(f"Missing columns: {missing}")
+audit["OUTCOME"] = np.select(
+    conditions, labels, default="UNKNOWN"
+)
 
 print("=" * 70)
-print("1. EPISODE COUNTS")
+print("STEP 11.6: EPISODE OUTCOME SUMMARY")
 print("=" * 70)
 
-print("Total episodes:", len(df))
-print("\nEVENT values:")
-print(df["EVENT"].value_counts(dropna=False))
-
-print("\nWARNING values:")
-print(df["WARNING"].value_counts(dropna=False))
-
-print("\nEVENT vs WARNING:")
-display(pd.crosstab(
-    df["EVENT"], df["WARNING"], dropna=False
-))
+display(
+    audit["OUTCOME"].value_counts()
+    .rename_axis("OUTCOME")
+    .to_frame("EPISODES")
+)
 
 # ------------------------------------------------------------
-# 2. MISSING DATA BY EVENT AND WARNING GROUP
+# 2. CALCULATE TRUE REPLACEMENT DETECTION RATE
 # ------------------------------------------------------------
 
-print("\n" + "=" * 70)
-print("2. MISSING TIMING INFORMATION")
-print("=" * 70)
+replacement = audit[audit.EVENT == 1].copy()
 
-missing_summary = df.groupby(
-    ["EVENT", "WARNING"], dropna=False
-).agg(
-    EPISODES=("EPISODE_ID", "size"),
-    MISSING_WARNING_START=("WARNING_START",
-                           lambda x: x.isna().sum()),
-    MISSING_EVENT_TIME=("EVENT_TIME",
-                        lambda x: x.isna().sum()),
-    MISSING_LEAD_TIME=("LEAD_TIME",
-                       lambda x: x.isna().sum())
-).reset_index()
+detected = replacement[replacement.WARNING == 1]
+missed = replacement[replacement.WARNING == 0]
 
-display(missing_summary)
+detection_rate = len(detected) / len(replacement)
+
+print("\nREPLACEMENT PERFORMANCE")
+print("-" * 50)
+
+print("Replacement episodes:", len(replacement))
+print("Detected:", len(detected))
+print("Missed:", len(missed))
+print("Detection rate:", round(detection_rate * 100, 2), "%")
 
 # ------------------------------------------------------------
-# 3. CHECK ONLY RECORDS WITH BOTH TIMES AVAILABLE
+# 3. DISPLAY MISSED REPLACEMENTS
 # ------------------------------------------------------------
 
-for col in ["WARNING_START", "EVENT_TIME", "LEAD_TIME"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
+print("\nMISSED REPLACEMENT EPISODES")
 
-timed = df[
-    df["WARNING_START"].notna()
-    & df["EVENT_TIME"].notna()
+display(
+    missed[
+        ["EPISODE_ID", "EVENT", "WARNING",
+         "WARNING_START", "EVENT_TIME"]
+    ].sort_values("EPISODE_ID")
+)
+
+# ------------------------------------------------------------
+# 4. CENSORED EPISODES WITH WARNINGS
+# ------------------------------------------------------------
+
+censored_alerts = audit[
+    (audit.EVENT == 0) & (audit.WARNING == 1)
 ].copy()
 
-timed["CALCULATED_LEAD_CYCLES"] = (
-    timed["EVENT_TIME"] - timed["WARNING_START"]
-)
-
-timed["POSITIVE_LEAD"] = (
-    timed["CALCULATED_LEAD_CYCLES"] > 0
-)
-
-timed["LEAD_MATCH"] = np.isclose(
-    timed["LEAD_TIME"],
-    timed["CALCULATED_LEAD_CYCLES"],
-    rtol=1e-5,
-    atol=1e-5,
-    equal_nan=False
-)
-
-print("\n" + "=" * 70)
-print("3. TIMED RECORDS ONLY")
-print("=" * 70)
-
-print("Records with both timestamps:", len(timed))
-print("Positive lead times:",
-      int(timed["POSITIVE_LEAD"].sum()))
-print("Non-positive lead times:",
-      int((~timed["POSITIVE_LEAD"]).sum()))
-print("Reported/calculated lead matches:",
-      int(timed["LEAD_MATCH"].sum()))
-
-print("\nLead-time distribution (cycles):")
+print("\nCENSORED EPISODES RECEIVING WARNINGS")
 
 display(
-    timed.loc[timed["POSITIVE_LEAD"],
-              "CALCULATED_LEAD_CYCLES"]
-    .describe(percentiles=[.10, .25, .50, .75, .90])
-    .to_frame()
+    censored_alerts[
+        ["EPISODE_ID", "WARNING_START",
+         "EVENT_TIME", "LEAD_TIME"]
+    ]
 )
 
+# These are unresolved alerts, NOT confirmed false positives.
+
 # ------------------------------------------------------------
-# 4. SHOW ACTUAL WARNING/REPLACEMENT RECORDS
+# 5. INVESTIGATE EXTREMELY LONG LEAD TIMES
 # ------------------------------------------------------------
 
-print("\n" + "=" * 70)
-print("4. RECORD-LEVEL REVIEW")
-print("=" * 70)
+valid_leads = detected[
+    detected.LEAD_TIME.notna() & (detected.LEAD_TIME > 0)
+].copy()
+
+print("\nLEAD TIME DISTRIBUTION")
 
 display(
-    df[
-        [
-            "EPISODE_ID", "EVENT", "WARNING",
-            "WARNING_START", "EVENT_TIME",
-            "LEAD_TIME"
-        ]
-    ].head(40)
+    valid_leads["LEAD_TIME"].describe(
+        percentiles=[.10, .25, .50, .75, .90, .95]
+    ).to_frame()
+)
+
+print("\nTOP 10 EARLIEST WARNINGS")
+
+display(
+    valid_leads[
+        ["EPISODE_ID", "WARNING_START",
+         "EVENT_TIME", "LEAD_TIME"]
+    ].sort_values("LEAD_TIME", ascending=False).head(10)
 )
 
 # ------------------------------------------------------------
-# 5. MULTIPLE REPLACEMENT EPISODE CHECK
+# 6. ESN / MULTIPLE EPISODE REVIEW
 # ------------------------------------------------------------
 
-df["ESN"] = df["EPISODE_ID"].astype(str).str.replace(
+audit["ESN"] = audit["EPISODE_ID"].astype(str).str.replace(
     r"_\d+$", "", regex=True
 )
 
-esn_summary = df.groupby("ESN").agg(
+multiple = audit.groupby("ESN").agg(
     EPISODES=("EPISODE_ID", "nunique"),
-    TOTAL_RECORDS=("EPISODE_ID", "size")
+    REPLACEMENTS=("EVENT", "sum"),
+    WARNINGS=("WARNING", "sum")
 ).reset_index()
 
-print("\n" + "=" * 70)
-print("5. MULTIPLE EPISODES PER ESN")
-print("=" * 70)
+print("\nMULTIPLE EPISODE SUMMARY")
 
-print("Unique ESNs:", df["ESN"].nunique())
+print("Unique ESNs:", audit.ESN.nunique())
 print("ESNs with multiple episodes:",
-      int((esn_summary["EPISODES"] > 1).sum()))
+      (multiple.EPISODES > 1).sum())
+
+print("\nESNs with multiple replacement events")
 
 display(
-    esn_summary[esn_summary["EPISODES"] > 1]
-    .sort_values("EPISODES", ascending=False)
+    multiple[multiple.REPLACEMENTS > 1]
+    .sort_values("REPLACEMENTS", ascending=False)
 )
 
 # ------------------------------------------------------------
-# 6. DUPLICATE EPISODE CHECK
+# 7. FINAL RECONCILIATION
 # ------------------------------------------------------------
 
-print("\nDuplicate episode records:",
-      int(df["EPISODE_ID"].duplicated().sum()))
-
 print("\n" + "=" * 70)
-print("STEP 11.5B COMPLETE")
-print("No model or threshold has been changed.")
+print("FINAL RECONCILIATION")
 print("=" * 70)
+
+print("Total episodes:", len(audit))
+print("Actual replacements:", len(replacement))
+print("Detected replacements:", len(detected))
+print("Missed replacements:", len(missed))
+print("Censored alerts:", len(censored_alerts))
+print("Detection rate:", round(detection_rate * 100, 2), "%")
+
+print("\nSTEP 11.6 COMPLETE")
