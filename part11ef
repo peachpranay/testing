@@ -1,50 +1,723 @@
 
-# STEP 11.8: DETECTION RECONCILIATION
+# ================================================================
+# CELL 9 - OIQ THRESHOLD VALIDATION FOR BREATHER REPLACEMENT
+# ================================================================
+#
+# OBJECTIVE:
+# 1. Validate whether OIQ <= 7 qt precedes breather replacement.
+# 2. Calculate time between first/last threshold crossing and replacement.
+# 3. Track Run_Number to identify shop visit transitions.
+# 4. Generate engine-level validation statistics.
+# 5. Provide an interactive ESN health visualization.
+#
+# INPUTS:
+# df_ff : Engine sensor observations
+# df_ev : Breather replacement / event records
+#
+# NO NEW ML MODEL
+# ================================================================
 
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import ipywidgets as widgets
 
-print("=" * 65)
-print("STEP 11.8: DETECTION RECONCILIATION")
-print("=" * 65)
+from IPython.display import display, clear_output
 
-print("\nEVALUATED DATAFRAME")
-print("Rows:", len(evaluated))
-print("Columns:", evaluated.columns.tolist())
+# ------------------------------------------------
+# 1. CONFIGURATION
+# ------------------------------------------------
 
-# Detected replacement episodes
-detected_35 = set(
-    evaluated.loc[
-        (evaluated["EVENT"] == 1) &
-        (evaluated["WARNING"] == 1),
-        "EPISODE_ID"
-    ].astype(str)
+OIQ_THRESHOLD = 7.0
+
+ESN_COL = 'esn'
+DATE_COL = 'date'
+RAW_COL = 'oiq'
+SMOOTH_COL = 'oiq_m30'
+EVENT_DATE_COL = 'repl_date'
+EVENT_REASON_COL = 'reason'
+
+# Set True if df_ev has already been filtered to
+# confirmed breather replacement events.
+USE_CLEAN_EVENT_REASONS = True
+
+CLEAN_REASONS = {
+    'EHM', 'HOC', 'LOQ', 'LOQ ECAM',
+    'Odor Report Reaction', 'odour report',
+    'CAQ', 'CAQ & Oil Leak', 'EHM ASR',
+    'IFSD', 'Unknown'
+}
+
+# ------------------------------------------------
+# 2. PREPARE DATA
+# ------------------------------------------------
+
+sensor = df_ff.copy()
+events = df_ev.copy()
+
+sensor[ESN_COL] = sensor[ESN_COL].astype(str)
+events[ESN_COL] = events[ESN_COL].astype(str)
+
+sensor[DATE_COL] = pd.to_datetime(
+    sensor[DATE_COL], errors='coerce'
 )
 
-print("\nDetected replacement episodes:", len(detected_35))
-
-# Missed replacement episodes
-missed_15 = set(
-    evaluated.loc[
-        (evaluated["EVENT"] == 1) &
-        (evaluated["WARNING"] == 0),
-        "EPISODE_ID"
-    ].astype(str)
+events[EVENT_DATE_COL] = pd.to_datetime(
+    events[EVENT_DATE_COL], errors='coerce'
 )
 
-print("Missed replacement episodes:", len(missed_15))
+sensor = sensor.dropna(
+    subset=[ESN_COL, DATE_COL, RAW_COL]
+).copy()
 
-# Show all other relevant DataFrames
-print("\nPOTENTIAL SOURCE DATAFRAMES")
-print("-" * 65)
+events = events.dropna(
+    subset=[ESN_COL, EVENT_DATE_COL]
+).copy()
 
-for name, obj in list(globals().items()):
-    if isinstance(obj, pd.DataFrame):
-        cols = obj.columns.tolist()
+sensor = sensor.sort_values(
+    [ESN_COL, DATE_COL]
+).reset_index(drop=True)
 
-        if "EPISODE_ID" in cols:
-            print(
-                f"{name}: rows={len(obj)}, "
-                f"columns={cols}"
+# Identify Run_Number column
+run_candidates = [
+    'Run_Number', 'run_number',
+    'run', 'Run Number'
+]
+
+RUN_COL = next(
+    (c for c in run_candidates if c in sensor.columns),
+    None
+)
+
+if RUN_COL is None:
+    raise ValueError(
+        "Run_Number column not found. "
+        "Check the actual shop visit column name."
+    )
+
+sensor[RUN_COL] = pd.to_numeric(
+    sensor[RUN_COL], errors='coerce'
+)
+
+# ------------------------------------------------
+# 3. CALCULATE 30-OBSERVATION ROLLING OIQ
+# ------------------------------------------------
+
+if SMOOTH_COL not in sensor.columns:
+
+    print("Calculating OIQ rolling mean...")
+
+    sensor[SMOOTH_COL] = (
+        sensor.groupby(ESN_COL)[RAW_COL]
+        .transform(
+            lambda s: s.rolling(
+                window=30,
+                min_periods=5
+            ).mean()
+        )
+    )
+
+sensor['BELOW_7'] = (
+    sensor[SMOOTH_COL] <= OIQ_THRESHOLD
+)
+
+print("Sensor rows:", len(sensor))
+print("Unique ESNs:", sensor[ESN_COL].nunique())
+print("Replacement event rows:", len(events))
+print("Run number column:", RUN_COL)
+
+# ------------------------------------------------
+# 4. FILTER BREATHER REPLACEMENT EVENTS
+# ------------------------------------------------
+
+if USE_CLEAN_EVENT_REASONS and EVENT_REASON_COL in events.columns:
+
+    events = events[
+        events[EVENT_REASON_COL]
+        .astype(str)
+        .str.strip()
+        .isin(CLEAN_REASONS)
+    ].copy()
+
+# Remove duplicate records for the same replacement
+events = (
+    events.sort_values(EVENT_DATE_COL)
+    .drop_duplicates(
+        subset=[ESN_COL, EVENT_DATE_COL]
+    )
+    .reset_index(drop=True)
+)
+
+# ------------------------------------------------
+# 5. HELPER: GET ENGINE RUN NUMBER AT A DATE
+# ------------------------------------------------
+
+def get_run_at_date(g, date):
+
+    previous = g[g[DATE_COL] <= date]
+
+    if previous.empty:
+        return np.nan
+
+    return previous[RUN_COL].dropna().iloc[-1] \
+        if not previous[RUN_COL].dropna().empty else np.nan
+
+
+# ------------------------------------------------
+# 6. VALIDATE EACH REPLACEMENT EVENT
+# ------------------------------------------------
+
+results = []
+
+events = events.sort_values(
+    [ESN_COL, EVENT_DATE_COL]
+)
+
+for esn, ev_group in events.groupby(ESN_COL):
+
+    g = sensor[
+        sensor[ESN_COL] == esn
+    ].sort_values(DATE_COL).copy()
+
+    if g.empty:
+        continue
+
+    replacement_dates = sorted(
+        ev_group[EVENT_DATE_COL].unique()
+    )
+
+    for i, replacement_date in enumerate(replacement_dates):
+
+        # Previous replacement defines the start of
+        # the current breather operating episode.
+
+        previous_replacement = (
+            replacement_dates[i - 1]
+            if i > 0 else g[DATE_COL].min()
+        )
+
+        # Sensor observations before replacement
+        window = g[
+            (g[DATE_COL] > previous_replacement)
+            & (g[DATE_COL] <= replacement_date)
+        ].copy()
+
+        if window.empty:
+            continue
+
+        # Below-threshold observations
+        below = window[
+            window[SMOOTH_COL] <= OIQ_THRESHOLD
+        ].copy()
+
+        # First and last threshold crossings
+        if not below.empty:
+
+            first_cross = below[DATE_COL].min()
+            last_cross = below[DATE_COL].max()
+
+            days_first = (
+                replacement_date - first_cross
+            ).total_seconds() / 86400
+
+            days_last = (
+                replacement_date - last_cross
+            ).total_seconds() / 86400
+
+            oiq_at_first = below.loc[
+                below[DATE_COL].idxmin(), SMOOTH_COL
+            ]
+
+            run_at_cross = get_run_at_date(
+                g, first_cross
             )
 
-print("\nSTEP 11.8 DIAGNOSTIC COMPLETE")
+            run_at_last = get_run_at_date(
+                g, last_cross
+            )
+
+        else:
+
+            first_cross = pd.NaT
+            last_cross = pd.NaT
+
+            days_first = np.nan
+            days_last = np.nan
+
+            oiq_at_first = np.nan
+            run_at_cross = np.nan
+            run_at_last = np.nan
+
+        # Run number at replacement
+        run_at_replacement = get_run_at_date(
+            g, replacement_date
+        )
+
+        # Shop visit transitions between first crossing
+        # and replacement, based on observed Run_Number changes.
+
+        if pd.notna(first_cross):
+
+            transition_window = g[
+                (g[DATE_COL] >= first_cross)
+                & (g[DATE_COL] <= replacement_date)
+            ].dropna(subset=[RUN_COL])
+
+            run_transitions = (
+                transition_window[RUN_COL]
+                .diff()
+                .ne(0)
+                .sum() - (1 if len(transition_window) else 0)
+            )
+
+            run_transitions = max(0, int(run_transitions))
+
+        else:
+            run_transitions = np.nan
+
+        # Event reason
+        event_rows = ev_group[
+            ev_group[EVENT_DATE_COL] == replacement_date
+        ]
+
+        reason = (
+            str(event_rows.iloc[0][EVENT_REASON_COL])
+            if EVENT_REASON_COL in event_rows.columns
+            else 'Breather replacement'
+        )
+
+        results.append({
+
+            'ESN': esn,
+
+            'Replacement_Date': replacement_date,
+
+            'Replacement_Reason': reason,
+
+            'First_Threshold_Date': first_cross,
+
+            'Last_Threshold_Date': last_cross,
+
+            'OIQ_at_First_Crossing': oiq_at_first,
+
+            'Days_First_Cross_to_Replacement': days_first,
+
+            'Days_Last_Cross_to_Replacement': days_last,
+
+            'Run_at_First_Crossing': run_at_cross,
+
+            'Run_at_Last_Crossing': run_at_last,
+
+            'Run_at_Replacement': run_at_replacement,
+
+            'Shop_Visit_Transitions': run_transitions,
+
+            'Threshold_Crossed': int(not below.empty),
+
+            'Below_7_Observations': len(below),
+
+            'Observations_Before_Replacement': len(window)
+
+        })
+
+results_df = pd.DataFrame(results)
+
+if results_df.empty:
+    raise ValueError(
+        "No matching replacement events found. "
+        "Check the event filters and ESN/date columns."
+    )
+
+# ------------------------------------------------
+# 7. SUMMARY STATISTICS
+# ------------------------------------------------
+
+crossed = results_df[
+    results_df['Threshold_Crossed'] == 1
+].copy()
+
+not_crossed = results_df[
+    results_df['Threshold_Crossed'] == 0
+].copy()
+
+total = len(results_df)
+n_crossed = len(crossed)
+
+print("\n" + "=" * 65)
+print("OIQ THRESHOLD VALIDATION RESULTS")
+print("=" * 65)
+
+print(f"Total replacement events: {total}")
+
+print(
+    f"Events with OIQ <= 7 before replacement: "
+    f"{n_crossed} ({100*n_crossed/total:.1f}%)"
+)
+
+print(
+    f"Events without observed threshold crossing: "
+    f"{len(not_crossed)} ({100*len(not_crossed)/total:.1f}%)"
+)
+
+if not crossed.empty:
+
+    print("\nTIME FROM FIRST THRESHOLD CROSSING TO REPLACEMENT")
+
+    print(
+        "Mean days:",
+        round(crossed[
+            'Days_First_Cross_to_Replacement'
+        ].mean(), 1)
+    )
+
+    print(
+        "Median days:",
+        round(crossed[
+            'Days_First_Cross_to_Replacement'
+        ].median(), 1)
+    )
+
+    print(
+        "25th percentile:",
+        round(crossed[
+            'Days_First_Cross_to_Replacement'
+        ].quantile(0.25), 1)
+    )
+
+    print(
+        "75th percentile:",
+        round(crossed[
+            'Days_First_Cross_to_Replacement'
+        ].quantile(0.75), 1)
+    )
+
+    print("\nTIME FROM LAST BELOW-THRESHOLD OBSERVATION")
+
+    print(
+        "Median days:",
+        round(crossed[
+            'Days_Last_Cross_to_Replacement'
+        ].median(), 1)
+    )
+
+    print("\nSHOP VISIT TRANSITIONS")
+
+    print(
+        crossed[
+            'Shop_Visit_Transitions'
+        ].value_counts(dropna=False).sort_index()
+    )
+
+# ------------------------------------------------
+# 8. DISTRIBUTION OF REPLACEMENT LEAD TIME
+# ------------------------------------------------
+
+if not crossed.empty:
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    ax.hist(
+        crossed['Days_First_Cross_to_Replacement'].dropna(),
+        bins=20,
+        edgecolor='black',
+        alpha=0.8
+    )
+
+    ax.set_title(
+        'Time Between OIQ Threshold Crossing and Breather Replacement'
+    )
+
+    ax.set_xlabel(
+        'Days from first OIQ <= 7 qt to replacement'
+    )
+
+    ax.set_ylabel('Number of replacement events')
+
+    ax.grid(axis='y', alpha=0.25)
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------
+# 9. SHOP VISIT COMPARISON
+# ------------------------------------------------
+
+if not crossed.empty:
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    shop_counts = (
+        crossed['Shop_Visit_Transitions']
+        .value_counts()
+        .sort_index()
+    )
+
+    ax.bar(
+        shop_counts.index.astype(str),
+        shop_counts.values,
+        edgecolor='black'
+    )
+
+    ax.set_title(
+        'Shop Visit Transitions Between OIQ Crossing and Replacement'
+    )
+
+    ax.set_xlabel('Run number transitions')
+    ax.set_ylabel('Replacement events')
+
+    ax.grid(axis='y', alpha=0.25)
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------------------------------
+# 10. INTERACTIVE ENGINE HEALTH VISUALIZATION
+# ------------------------------------------------
+
+ESN_OPTIONS = sorted(sensor[ESN_COL].unique())
+
+def draw_engine(esn):
+
+    g = sensor[
+        sensor[ESN_COL] == esn
+    ].sort_values(DATE_COL).copy()
+
+    ev = events[
+        events[ESN_COL] == esn
+    ].sort_values(EVENT_DATE_COL)
+
+    if g.empty:
+        print("No sensor data available.")
+        return
+
+    fig, ax = plt.subplots(figsize=(16, 7))
+
+    ax.plot(
+        g[DATE_COL],
+        g[RAW_COL],
+        color='#90A4AE',
+        linewidth=0.9,
+        alpha=0.65,
+        label='Raw daily OIQ'
+    )
+
+    ax.plot(
+        g[DATE_COL],
+        g[SMOOTH_COL],
+        color='#1565C0',
+        linewidth=2.2,
+        label='30-observation rolling OIQ'
+    )
+
+    # Threshold
+    ax.axhline(
+        OIQ_THRESHOLD,
+        color='#B71C1C',
+        linestyle='--',
+        linewidth=1.8,
+        label='OIQ threshold = 7 qt'
+    )
+
+    # Highlight below-threshold region
+    ax.fill_between(
+        g[DATE_COL],
+        g[SMOOTH_COL],
+        OIQ_THRESHOLD,
+        where=(
+            g[SMOOTH_COL] <= OIQ_THRESHOLD
+        ),
+        color='#EF9A9A',
+        alpha=0.35,
+        label='Below 7 qt'
+    )
+
+    # Run number on secondary axis
+    ax2 = ax.twinx()
+
+    ax2.step(
+        g[DATE_COL],
+        g[RUN_COL],
+        where='post',
+        color='#2E7D32',
+        linewidth=1.5,
+        alpha=0.8,
+        label='Run Number / Shop Visit'
+    )
+
+    # Mark shop visit transitions
+    run_changes = g[
+        g[RUN_COL].notna()
+        & g[RUN_COL].ne(g[RUN_COL].shift())
+    ].copy()
+
+    for j, (_, row) in enumerate(run_changes.iterrows()):
+
+        if j == 0:
+            continue
+
+        ax.axvline(
+            row[DATE_COL],
+            color='#6A1B9A',
+            linestyle='-.',
+            alpha=0.65,
+            linewidth=1.2
+        )
+
+        ax.annotate(
+            f"Shop visit\nRun {row[RUN_COL]:g}",
+            xy=(row[DATE_COL], 0.95),
+            xycoords=('data', 'axes fraction'),
+            rotation=90,
+            fontsize=7,
+            color='#6A1B9A',
+            va='top',
+            ha='right'
+        )
+
+    # Mark breather replacements
+    for _, row in ev.iterrows():
+
+        rd = row[EVENT_DATE_COL]
+
+        ax.axvline(
+            rd,
+            color='#D32F2F',
+            linestyle=':',
+            linewidth=2,
+            label='Breather replacement'
+        )
+
+    # Mark threshold crossings associated with replacement
+    engine_results = results_df[
+        results_df['ESN'] == esn
+    ]
+
+    for _, row in engine_results.iterrows():
+
+        if pd.notna(row['First_Threshold_Date']):
+
+            ax.axvline(
+                row['First_Threshold_Date'],
+                color='#F57C00',
+                linestyle='--',
+                linewidth=1.4,
+                alpha=0.85,
+                label='First OIQ threshold crossing'
+            )
+
+    # Avoid duplicate legend labels
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+
+    unique = dict(zip(l1 + l2, h1 + h2))
+
+    ax.legend(
+        unique.values(),
+        unique.keys(),
+        loc='upper left',
+        fontsize=8
+    )
+
+    ax.set_title(
+        f'ESN {esn} | OIQ Health & Breather Replacement History',
+        fontsize=14,
+        fontweight='bold'
+    )
+
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Oil Quantity (qt)')
+    ax2.set_ylabel('Run Number (Shop Visit)')
+
+    ax.xaxis.set_major_locator(
+        mdates.AutoDateLocator()
+    )
+
+    ax.xaxis.set_major_formatter(
+        mdates.DateFormatter('%Y-%m')
+    )
+
+    ax.grid(alpha=0.2)
+
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+    # Engine-specific replacement summary
+    if not engine_results.empty:
+
+        display(
+            engine_results[
+                [
+                    'Replacement_Date',
+                    'First_Threshold_Date',
+                    'Days_First_Cross_to_Replacement',
+                    'Days_Last_Cross_to_Replacement',
+                    'Run_at_First_Crossing',
+                    'Run_at_Replacement',
+                    'Shop_Visit_Transitions'
+                ]
+            ].reset_index(drop=True)
+        )
+
+# Interactive dropdown
+esn_dropdown = widgets.Dropdown(
+    options=ESN_OPTIONS,
+    description='Engine ESN:',
+    layout=widgets.Layout(width='450px')
+)
+
+output = widgets.Output()
+
+def refresh(change=None):
+
+    with output:
+
+        clear_output(wait=True)
+
+        draw_engine(esn_dropdown.value)
+
+esn_dropdown.observe(
+    refresh,
+    names='value'
+)
+
+display(
+    widgets.VBox([
+        widgets.HTML(
+            '<h3>OIQ Breather Replacement Validation</h3>'
+            '<p>Select an engine to inspect threshold crossings, '
+            'shop visits and replacement events.</p>'
+        ),
+        esn_dropdown,
+        output
+    ])
+)
+
+refresh()
+
+# ------------------------------------------------
+# 11. FINAL EVENT-LEVEL RESULTS TABLE
+# ------------------------------------------------
+
+print("\nCOMPLETE REPLACEMENT VALIDATION TABLE")
+
+display(
+    results_df.sort_values(
+        'Days_First_Cross_to_Replacement',
+        ascending=False,
+        na_position='last'
+    ).reset_index(drop=True)
+)
+
+# ------------------------------------------------
+# 12. EXPORT RESULTS
+# ------------------------------------------------
+
+results_df.to_csv(
+    '/tmp/oiq_breather_threshold_validation.csv',
+    index=False
+)
+
+print("\nValidation completed.")
+print("Results saved to /tmp/oiq_breather_threshold_validation.csv")
